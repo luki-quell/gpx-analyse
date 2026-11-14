@@ -102,6 +102,11 @@
   th { background: #f6f8fa; color: #5b6b78; font-weight: 600; font-size: 12.5px; }
   .chips { display: flex; flex-wrap: wrap; gap: 8px; }
   .chip { background: #fff; border: 1px solid #e0e7ed; border-radius: 999px; padding: 5px 12px; font-size: 13px; }
+  .wxdetail { font-size: 12.5px; color: #5b6b78; margin-top: 3px; line-height: 1.5; }
+  #weatherBlock input[type="date"] { font: inherit; padding: 7px 10px; border-radius: 10px; border: 1px solid #c7d2db; background: #fff; color: #17242f; }
+  input[type="range"] { accent-color: #d9480f; }
+  #liveCard { border-color: #2f9e44; background: #f4fbf5; }
+  #liveStats { font-size: 13px; color: #4a5c68; margin-top: 4px; line-height: 1.6; }
   footer { color: #7d8b96; font-size: 12.5px; padding: 30px 16px 40px; line-height: 1.6; }
 </style>
 </head>
@@ -123,14 +128,27 @@
         <input id="file" type="file" accept=".gpx,.xml,text/xml,application/gpx+xml" hidden />
       </label>
       <button id="demoBtn">Beispiel-Tour laden</button>
+      <button id="liveBtn">● Live-Tour aufzeichnen</button>
     </div>
-    <p class="note">Die Datei wird nicht hochgeladen – alle Berechnungen laufen auf deinem Gerät.</p>
+    <p class="note">Die Datei wird nicht hochgeladen – alle Berechnungen laufen auf deinem Gerät. Für die Live-Aufzeichnung einfach Standortfreigabe erlauben (am besten am Handy).</p>
   </section>
 
   <section id="results" hidden>
+    <div id="liveCard" class="summarybar" hidden>
+      <span>
+        <span class="fname" id="liveStatus">🔴 Live-Aufzeichnung läuft</span>
+        <div id="liveStats"></div>
+      </span>
+      <span style="display:flex;gap:10px;flex-wrap:wrap;">
+        <button id="livePauseBtn">Pause</button>
+        <button id="liveFinishBtn" class="primary">Beenden &amp; analysieren</button>
+        <button id="liveStopBtn">Verwerfen</button>
+      </span>
+    </div>
     <div class="summarybar">
       <span class="fname" id="fname"></span>
       <span style="display:flex;gap:10px;">
+        <button id="gpxBtn">GPX exportieren</button>
         <button id="csvBtn">CSV exportieren</button>
         <button id="resetBtn">Neue Analyse</button>
       </span>
@@ -174,6 +192,18 @@
       </div>
     </div>
 
+    <h3>Wetter entlang der Strecke</h3>
+    <div class="chartblock" id="weatherBlock">
+      <div style="display:flex;gap:12px;align-items:center;flex-wrap:wrap;margin-bottom:12px;">
+        <input type="date" id="wxDate" />
+        <input type="range" id="wxHour" min="5" max="21" value="9" aria-label="Uhrzeit" style="flex:1;min-width:120px;" />
+        <span id="wxHourLbl" style="font-variant-numeric:tabular-nums;font-weight:600;">09:00</span>
+        <button id="wxFetchBtn" class="primary">Wetter abrufen</button>
+      </div>
+      <div id="wxStatus" style="font-size:13px;color:#5b6b78;margin-bottom:12px;"></div>
+      <div id="wxCards" class="stats"></div>
+    </div>
+
     <div id="segmentsWrap" hidden>
       <h3>Abschnitte</h3>
       <table id="segments"></table>
@@ -190,6 +220,7 @@
   Eine einzige HTML-Datei – als <em>index.html</em> direkt für GitHub Pages geeignet. Kein Backend, keine Cookies, kein Tracking.
   Die Karte lädt ihre Kacheln direkt vom gewählten Anbieter (OpenTopoMap, OpenStreetMap oder swisstopo) – der Track selbst bleibt zu jedem Zeitpunkt auf deinem Gerät.
   Klick in die Karte: WGS84-Koordinaten, in der Schweiz zusätzlich LV95 (offizielle swisstopo-Näherung).
+  Wetter: Open-Meteo.com – Abruf live ohne API-Key und Konto. GPS-Tracking läuft komplett auf dem Gerät.
   Wanderzeit nach Schweizer Formel: 4,2&nbsp;km/h horizontal, 400&nbsp;m/h Aufstieg, 800&nbsp;m/h Abstieg.
 </footer>
 
@@ -320,8 +351,12 @@ function analyzeText(text, fileName) {
     }
     segRanges.push({ start, end: points.length, name: seg.name || ('Abschnitt ' + (i + 1)) });
   });
+  analyzePoints(points, segRanges, parsed.wpts, fileName, false);
+}
 
+function analyzePoints(points, segRanges, wpts, fileName, liveMode) {
   const n = points.length;
+  if (n === 0) throw new Error('Keine Trackpunkte gefunden.');
   const hasEle = points.filter(p => Number.isFinite(p.ele)).length / n > 0.8;
   const hasTime = points.filter(p => Number.isFinite(p.time)).length / n > 0.8;
 
@@ -358,7 +393,7 @@ function analyzeText(text, fileName) {
 
   const swiss = (total / 1000) / 4.2 + (hasEle ? up / 400 + down / 800 : 0);
 
-  state = { fileName, points, segRanges, wpts: parsed.wpts, hasEle, hasTime, sm, total, eleMin, eleMax, up, down, duration, moving, avgMoving, maxSpeed, swiss };
+  state = { fileName, points, segRanges, wpts, hasEle, hasTime, sm, total, eleMin, eleMax, up, down, duration, moving, avgMoving, maxSpeed, swiss, live: !!liveMode };
   render();
 }
 
@@ -368,6 +403,16 @@ function render() {
   $('#error').hidden = true;
   $('#results').hidden = false;
   $('#dropzone').hidden = true;
+  $('#liveCard').hidden = !state.live;
+  wxCache = null;
+  $('#wxCards').innerHTML = '';
+  $('#wxStatus').textContent = '';
+  if (state.hasTime) {
+    const d0 = new Date(state.points[0].time);
+    const h0 = Math.max(5, Math.min(21, d0.getHours()));
+    $('#wxHour').value = h0;
+    $('#wxHourLbl').textContent = String(h0).padStart(2, '0') + ':00';
+  }
 
   const cards = [];
   cards.push({ label: 'Distanz', value: fmtKm(state.total) });
@@ -395,7 +440,14 @@ function render() {
   renderSegments();
   renderWpts();
   drawProfile(null);
-  initMapForTrack();
+  if (state.live) {
+    $('#coordBox').hidden = true;
+    if (state.points.length <= 40) fitTrack();
+    renderTiles();
+    renderOverlay();
+  } else {
+    initMapForTrack();
+  }
 }
 
 function renderSegments() {
@@ -859,6 +911,271 @@ $('#csvBtn').addEventListener('click', () => {
   URL.revokeObjectURL(a.href);
 });
 
+/* ---------- GPX-Export (auch für Live-Touren) ---------- */
+$('#gpxBtn').addEventListener('click', () => {
+  if (!state) return;
+  const esc = s => String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+  const segs = state.segRanges.map(r => {
+    const body = state.points.slice(r.start, r.end).map(p => {
+      let t = '<trkpt lat="' + p.lat.toFixed(6) + '" lon="' + p.lon.toFixed(6) + '">';
+      if (Number.isFinite(p.ele)) t += '<ele>' + p.ele.toFixed(1) + '</ele>';
+      if (Number.isFinite(p.time)) t += '<time>' + new Date(p.time).toISOString() + '</time>';
+      return t + '</trkpt>';
+    }).join('');
+    return '<trkseg>' + body + '</trkseg>';
+  }).join('');
+  const gpx = '<?xml version="1.0" encoding="UTF-8"?><gpx version="1.1" creator="GPX-Analyse"><trk><name>' + esc(state.fileName || 'track') + '</name>' + segs + '</trk></gpx>';
+  const blob = new Blob([gpx], { type: 'application/gpx+xml' });
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(blob);
+  a.download = (state.fileName || 'track').replace(/\.gpx$/i, '') + '.gpx';
+  a.click();
+  URL.revokeObjectURL(a.href);
+});
+
+/* ---------- Wetter entlang der Strecke (Open-Meteo: kostenlos, ohne API-Key) ---------- */
+let wxCache = null;
+
+(function initWeatherInputs() {
+  const iso = d => d.toISOString().slice(0, 10);
+  const today = new Date();
+  const d = $('#wxDate');
+  d.value = iso(today);
+  d.min = iso(today);
+  d.max = iso(new Date(today.getTime() + 6 * 86400000));
+})();
+
+$('#wxHour').addEventListener('input', () => {
+  const h = $('#wxHour').value;
+  $('#wxHourLbl').textContent = String(h).padStart(2, '0') + ':00';
+  if (wxCache && wxCache.date === $('#wxDate').value) renderWx();
+});
+$('#wxDate').addEventListener('change', () => {
+  if (wxCache && wxCache.date !== $('#wxDate').value) {
+    wxCache = null;
+    $('#wxCards').innerHTML = '';
+    $('#wxStatus').textContent = '';
+  }
+});
+$('#wxFetchBtn').addEventListener('click', fetchWeather);
+
+async function fetchWeather() {
+  if (!state) return;
+  const date = $('#wxDate').value;
+  if (!date) return;
+  const btn = $('#wxFetchBtn');
+  const status = $('#wxStatus');
+  btn.disabled = true;
+  status.textContent = 'Wetterdaten werden geladen …';
+  try {
+    const pts = state.points;
+    const n = Math.min(8, pts.length);
+    const idxs = [];
+    for (let i = 0; i < n; i++) idxs.push(Math.min(pts.length - 1, Math.round(i * (pts.length - 1) / Math.max(1, n - 1))));
+    const uniq = [...new Set(idxs)];
+    const lats = uniq.map(i => pts[i].lat.toFixed(4)).join(',');
+    const lons = uniq.map(i => pts[i].lon.toFixed(4)).join(',');
+    const url = 'https://api.open-meteo.com/v1/forecast?latitude=' + lats + '&longitude=' + lons +
+      '&hourly=temperature_2m,precipitation,weather_code,wind_speed_10m&start_date=' + date +
+      '&end_date=' + date + '&timezone=auto&wind_speed_unit=kmh';
+    const res = await fetch(url);
+    if (!res.ok) throw new Error('Antwort ' + res.status);
+    const data = await res.json();
+    wxCache = { date, arr: Array.isArray(data) ? data : [data], idxs: uniq };
+    renderWx();
+  } catch (e) {
+    wxCache = null;
+    $('#wxCards').innerHTML = '';
+    status.textContent = '⚠️ Wetterdaten nicht verfügbar (' + e.message + ') – keine Netzverbindung? Auf GitHub Pages bzw. mit Internet funktioniert der Abruf.';
+  } finally {
+    btn.disabled = false;
+  }
+}
+
+function wmoInfo(c) {
+  if (c === 0) return ['☀️', 'klar'];
+  if (c === 1) return ['🌤️', 'heiter'];
+  if (c === 2) return ['⛅', 'teils wolkig'];
+  if (c === 3) return ['☁️', 'bedeckt'];
+  if (c === 45 || c === 48) return ['🌫️', 'Nebel'];
+  if (c >= 51 && c <= 57) return ['🌦️', 'Nieselregen'];
+  if (c >= 61 && c <= 67) return ['🌧️', 'Regen'];
+  if (c >= 71 && c <= 77) return ['🌨️', 'Schnee'];
+  if (c >= 80 && c <= 82) return ['🌦️', 'Schauer'];
+  if (c === 85 || c === 86) return ['🌨️', 'Schneeschauer'];
+  if (c >= 95) return ['⛈️', 'Gewitter'];
+  return ['🌡️', ''];
+}
+
+function renderWx() {
+  if (!wxCache || !state) return;
+  const hour = parseInt($('#wxHour').value, 10);
+  const pts = state.points;
+  const cards = [];
+  let minTemp = Infinity, minTempKm = '', wetCount = 0, shown = 0, maxWind = 0;
+  wxCache.arr.forEach((loc, k) => {
+    const i = wxCache.idxs[k];
+    const p = pts[i];
+    if (!loc.hourly || !loc.hourly.temperature_2m) return;
+    const t = loc.hourly.temperature_2m[hour];
+    if (t == null) return;
+    const pr = loc.hourly.precipitation ? (loc.hourly.precipitation[hour] || 0) : 0;
+    const ws = loc.hourly.wind_speed_10m ? (loc.hourly.wind_speed_10m[hour] || 0) : 0;
+    const wc = loc.hourly.weather_code ? loc.hourly.weather_code[hour] : null;
+    shown++;
+    const info = wmoInfo(wc);
+    if (t < minTemp) { minTemp = t; minTempKm = (p.dist / 1000).toFixed(1); }
+    if (pr > 0.1) wetCount++;
+    if (ws > maxWind) maxWind = ws;
+    let plan = '';
+    if (state.hasTime && Number.isFinite(p.time)) {
+      const d = new Date(p.time);
+      plan = ' · Track ' + fmt(d.getHours()) + ':' + String(d.getMinutes()).padStart(2, '0');
+    }
+    const eleTxt = (state.hasEle && state.sm && Number.isFinite(state.sm[i])) ? ' · ' + fmt(Math.round(state.sm[i])) + ' m' : '';
+    cards.push('<div class="card"><div class="label">km ' + (p.dist / 1000).toFixed(1) + eleTxt + '</div><div class="value">' + info[0] + ' ' + fmt(t, 1) + '°</div><div class="wxdetail">' + (info[1] ? info[1] + ' · ' : '') + 'Regen ' + fmt(pr, 1) + ' mm · Wind ' + fmt(Math.round(ws)) + ' km/h' + plan + '</div></div>');
+  });
+  $('#wxCards').innerHTML = cards.join('');
+  let s = 'Vorhersage für ' + wxCache.date + ', ' + $('#wxHourLbl').textContent + ' · Quelle: Open-Meteo';
+  if (minTemp !== Infinity) s += ' · kältester Punkt: km ' + minTempKm + ' mit ' + fmt(minTemp, 1) + '°';
+  if (wetCount > 0) s += ' · ⚠️ Niederschlag an ' + wetCount + ' von ' + shown + ' Punkten';
+  if (maxWind >= 40) s += ' · ⚠️ starker Wind bis ' + fmt(Math.round(maxWind)) + ' km/h';
+  $('#wxStatus').textContent = s;
+}
+
+/* ---------- Live-Tracking über GPS (alles lokal) ---------- */
+let live = null;
+let liveTimer = null;
+
+function startLive() {
+  $('#dropzone').hidden = true;
+  $('#results').hidden = false;
+  $('#liveCard').hidden = false;
+  if (!navigator.geolocation) {
+    $('#liveStatus').textContent = '⚠️ GPS nicht verfügbar';
+    $('#liveStats').textContent = 'Dieser Browser unterstützt keine Standortbestimmung.';
+    return;
+  }
+  live = { pts: [], paused: false, start: Date.now(), watchId: null, err: '' };
+  $('#error').hidden = true;
+  $('#liveStatus').textContent = '🔴 Live-Aufzeichnung läuft';
+  $('#livePauseBtn').textContent = 'Pause';
+  updateLiveStats();
+  liveTimer = setInterval(updateLiveStats, 1000);
+  live.watchId = navigator.geolocation.watchPosition(livePos, liveErr, { enableHighAccuracy: true, maximumAge: 5000, timeout: 20000 });
+}
+
+function liveErr(err) {
+  if (!live) return;
+  const msgs = {
+    1: 'Standortzugriff verweigert – bitte im Browser erlauben.',
+    2: 'Position nicht verfügbar.',
+    3: 'Zeitüberschreitung beim GPS-Empfang.'
+  };
+  live.err = '⚠️ GPS: ' + (msgs[err.code] || err.message);
+}
+
+function livePos(pos) {
+  if (!live || live.paused) return;
+  const c = pos.coords;
+  if (c && Number.isFinite(c.accuracy) && c.accuracy > 100) return;
+  const p = {
+    lat: c.latitude,
+    lon: c.longitude,
+    ele: (c.altitude != null && Number.isFinite(c.altitude)) ? c.altitude : NaN,
+    time: pos.timestamp,
+    acc: c.accuracy
+  };
+  const last = live.pts[live.pts.length - 1];
+  if (last) {
+    const d = haversine(last, p);
+    if (d < 3 && p.time - last.time < 30000) return;
+    p.dist = last.dist + d;
+  } else {
+    p.dist = 0;
+  }
+  p.segIndex = 0;
+  live.pts.push(p);
+  if (live.pts.length <= 10 || live.pts.length % 3 === 0) {
+    try {
+      analyzePoints(live.pts.slice(), [{ start: 0, end: live.pts.length, name: 'Live-Tour' }], [], 'live-tour.gpx', true);
+    } catch (e) { /* noch zu wenige Punkte – ignorieren */ }
+  }
+  updateLiveStats();
+}
+
+function liveSpeedKmh() {
+  const pts = live.pts;
+  if (pts.length < 2) return 0;
+  const last = pts[pts.length - 1];
+  for (let i = pts.length - 2; i >= 0; i--) {
+    const dt = (last.time - pts[i].time) / 1000;
+    if (dt >= 20) return (last.dist - pts[i].dist) / dt * 3.6;
+  }
+  const dt = (last.time - pts[0].time) / 1000;
+  return dt > 0 ? (last.dist / dt) * 3.6 : 0;
+}
+
+function updateLiveStats() {
+  if (!live) return;
+  const dur = Math.floor((Date.now() - live.start) / 1000);
+  const h = String(Math.floor(dur / 3600)).padStart(2, '0');
+  const m = String(Math.floor((dur % 3600) / 60)).padStart(2, '0');
+  const s = String(dur % 60).padStart(2, '0');
+  const last = live.pts[live.pts.length - 1];
+  let txt = '⏱ ' + h + ':' + m + ':' + s;
+  if (last) {
+    txt += ' · ' + fmtKm(last.dist) + ' · ' + liveSpeedKmh().toFixed(1) + ' km/h';
+    if (Number.isFinite(last.ele)) txt += ' · ' + fmtEle(last.ele);
+    if (Number.isFinite(last.acc)) txt += ' · ±' + fmt(Math.round(last.acc)) + ' m';
+    txt += ' · ' + fmt(live.pts.length) + ' Punkte';
+  } else {
+    txt += ' · warte auf GPS-Signal …';
+  }
+  if (live.err) txt += '<br>' + live.err;
+  $('#liveStats').innerHTML = txt;
+}
+
+function stopLiveWatch() {
+  if (live && live.watchId != null) navigator.geolocation.clearWatch(live.watchId);
+  clearInterval(liveTimer);
+}
+
+function finishLive() {
+  if (!live) return;
+  stopLiveWatch();
+  const pts = live.pts;
+  live = null;
+  if (pts.length < 2) {
+    showError('Zu wenig GPS-Punkte für eine Auswertung – war der Standortzugriff erlaubt und das Signal gut?');
+    $('#liveCard').hidden = true;
+    return;
+  }
+  const name = 'live-tour-' + new Date().toISOString().slice(0, 10) + '.gpx';
+  analyzePoints(pts, [{ start: 0, end: pts.length, name: 'Live-Tour' }], [], name, false);
+}
+
+function discardLive() {
+  if (!live) return;
+  stopLiveWatch();
+  live = null;
+  state = null;
+  $('#liveCard').hidden = true;
+  $('#results').hidden = true;
+  $('#dropzone').hidden = false;
+  $('#file').value = '';
+}
+
+$('#liveBtn').addEventListener('click', startLive);
+$('#livePauseBtn').addEventListener('click', () => {
+  if (!live) return;
+  live.paused = !live.paused;
+  $('#livePauseBtn').textContent = live.paused ? 'Weiter' : 'Pause';
+  $('#liveStatus').textContent = live.paused ? '⏸️ Pausiert' : '🔴 Live-Aufzeichnung läuft';
+});
+$('#liveFinishBtn').addEventListener('click', finishLive);
+$('#liveStopBtn').addEventListener('click', discardLive);
+
 /* ---------- Datei-Handling ---------- */
 function showError(msg) {
   $('#results').hidden = false;
@@ -890,6 +1207,10 @@ dz.addEventListener('drop', e => {
 });
 
 $('#resetBtn').addEventListener('click', () => {
+  if (live) {
+    stopLiveWatch();
+    live = null;
+  }
   state = null;
   hoverIdxMap = null;
   clearTiles();
