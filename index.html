@@ -107,6 +107,11 @@
   input[type="range"] { accent-color: #d9480f; }
   #liveCard { border-color: #2f9e44; background: #f4fbf5; }
   #liveStats { font-size: 13px; color: #4a5c68; margin-top: 4px; line-height: 1.6; }
+  #wxPills { position: absolute; inset: 0; pointer-events: none; z-index: 3; }
+  .wxpill { position: absolute; transform: translate(-50%, -170%); background: rgba(255,255,255,.95); border: 1px solid #c7d2db; border-radius: 999px; padding: 3px 9px; font-size: 12px; font-weight: 600; white-space: nowrap; box-shadow: 0 1px 4px rgba(0,0,0,.25); color: #17242f; }
+  .wxpill small { font-weight: 500; color: #5b6b78; margin-left: 5px; }
+  .wxpill.rain { border-color: #e5a0a0; background: #fff5f5; }
+  #weatherBlock select { font: inherit; padding: 7px 10px; border-radius: 10px; border: 1px solid #c7d2db; background: #fff; color: #17242f; }
   footer { color: #7d8b96; font-size: 12.5px; padding: 30px 16px 40px; line-height: 1.6; }
 </style>
 </head>
@@ -183,6 +188,7 @@
           <div id="dotStart" class="mapdot"></div>
           <div id="dotEnd" class="mapdot"></div>
           <div id="dotHover" class="mapdot"></div>
+          <div id="wxPills"></div>
           <div id="coordBox" hidden></div>
           <div id="offlineNote" hidden>Offline: Kartenkacheln nicht verfügbar – der Track wird ohne Hintergrund angezeigt. Mit Internetverbindung erscheint die Karte.</div>
           <div id="layerBtns"></div>
@@ -196,8 +202,12 @@
     <div class="chartblock" id="weatherBlock">
       <div style="display:flex;gap:12px;align-items:center;flex-wrap:wrap;margin-bottom:12px;">
         <input type="date" id="wxDate" />
-        <input type="range" id="wxHour" min="5" max="21" value="9" aria-label="Uhrzeit" style="flex:1;min-width:120px;" />
-        <span id="wxHourLbl" style="font-variant-numeric:tabular-nums;font-weight:600;">09:00</span>
+        <select id="wxTimeMode"></select>
+        <span id="wxStartWrap" style="display:flex;gap:8px;align-items:center;flex:1;min-width:140px;">
+          <span style="font-size:12px;color:#5b6b78;white-space:nowrap;">Start</span>
+          <input type="range" id="wxHour" min="5" max="21" value="9" aria-label="Startzeit" style="flex:1;min-width:80px;" />
+          <span id="wxHourLbl" style="font-variant-numeric:tabular-nums;font-weight:600;">09:00</span>
+        </span>
         <button id="wxFetchBtn" class="primary">Wetter abrufen</button>
       </div>
       <div id="wxStatus" style="font-size:13px;color:#5b6b78;margin-bottom:12px;"></div>
@@ -406,7 +416,17 @@ function render() {
   $('#liveCard').hidden = !state.live;
   wxCache = null;
   $('#wxCards').innerHTML = '';
+  $('#wxPills').innerHTML = '';
   $('#wxStatus').textContent = '';
+  const wxSel = $('#wxTimeMode');
+  if (state.hasTime) {
+    wxSel.innerHTML = '<option value="track">Zeiten aus Track</option><option value="sim">Simulation</option>';
+    wxSel.value = 'track';
+  } else {
+    wxSel.innerHTML = '<option value="sim">Simulation ab Start</option>';
+    wxSel.value = 'sim';
+  }
+  syncWxModeUI();
   if (state.hasTime) {
     const d0 = new Date(state.points[0].time);
     const h0 = Math.max(5, Math.min(21, d0.getHours()));
@@ -702,6 +722,7 @@ function renderOverlay() {
   const hd = $('#dotHover');
   if (hoverIdxMap != null) { hd.style.display = 'block'; place('#dotHover', pts[hoverIdxMap]); }
   else hd.style.display = 'none';
+  renderWxPills();
 }
 
 function fitTrack() {
@@ -948,7 +969,11 @@ let wxCache = null;
 $('#wxHour').addEventListener('input', () => {
   const h = $('#wxHour').value;
   $('#wxHourLbl').textContent = String(h).padStart(2, '0') + ':00';
-  if (wxCache && wxCache.date === $('#wxDate').value) renderWx();
+  if (wxCache && wxCache.date === $('#wxDate').value) { renderWx(); renderWxPills(); }
+});
+$('#wxTimeMode').addEventListener('change', () => {
+  syncWxModeUI();
+  if (wxCache && wxCache.date === $('#wxDate').value) { renderWx(); renderWxPills(); }
 });
 $('#wxDate').addEventListener('change', () => {
   if (wxCache && wxCache.date !== $('#wxDate').value) {
@@ -983,6 +1008,7 @@ async function fetchWeather() {
     const data = await res.json();
     wxCache = { date, arr: Array.isArray(data) ? data : [data], idxs: uniq };
     renderWx();
+    renderWxPills();
   } catch (e) {
     wxCache = null;
     $('#wxCards').innerHTML = '';
@@ -1007,9 +1033,51 @@ function wmoInfo(c) {
   return ['🌡️', ''];
 }
 
+/* Kumulative Auf-/Abstiege für die Ankunfts-Simulation (gleiche Hysterese wie die Statistik) */
+function cumUpDown(sm) {
+  const n = sm.length;
+  const up = new Array(n).fill(0);
+  const down = new Array(n).fill(0);
+  if (!n) return { up, down };
+  let anchor = sm[0], u = 0, d = 0;
+  for (let i = 1; i < n; i++) {
+    const diff = sm[i] - anchor;
+    if (diff >= 3) { u += diff; anchor = sm[i]; }
+    else if (diff <= -3) { d -= diff; anchor = sm[i]; }
+    up[i] = u;
+    down[i] = d;
+  }
+  return { up, down };
+}
+
+function fmtHour(h) {
+  const total = Math.round(h * 60);
+  return String(Math.floor(total / 60) % 24).padStart(2, '0') + ':' + String(total % 60).padStart(2, '0');
+}
+
+function syncWxModeUI() {
+  const track = ($('#wxTimeMode').value || 'sim') === 'track';
+  $('#wxStartWrap').style.display = track ? 'none' : 'flex';
+}
+
+/* Ankunftszeit (Stunde als Dezimalzahl) an jedem Wetterpunkt */
+function arrivalInfo() {
+  const mode = $('#wxTimeMode').value || 'sim';
+  const idxs = wxCache.idxs;
+  if (mode === 'track' && state.hasTime) {
+    return { mode: 'track', hours: idxs.map(i => { const d = new Date(state.points[i].time); return d.getHours() + d.getMinutes() / 60; }) };
+  }
+  const startH = parseInt($('#wxHour').value, 10) || 9;
+  if (!state.hasEle || !state.sm) {
+    return { mode: 'sim', hours: idxs.map(i => startH + state.points[i].dist / 1000 / 4.2) };
+  }
+  const cu = cumUpDown(state.sm);
+  return { mode: 'sim', hours: idxs.map(i => startH + state.points[i].dist / 1000 / 4.2 + cu.up[i] / 400 + cu.down[i] / 800) };
+}
+
 function renderWx() {
   if (!wxCache || !state) return;
-  const hour = parseInt($('#wxHour').value, 10);
+  const info = arrivalInfo();
   const pts = state.points;
   const cards = [];
   let minTemp = Infinity, minTempKm = '', wetCount = 0, shown = 0, maxWind = 0;
@@ -1017,30 +1085,57 @@ function renderWx() {
     const i = wxCache.idxs[k];
     const p = pts[i];
     if (!loc.hourly || !loc.hourly.temperature_2m) return;
-    const t = loc.hourly.temperature_2m[hour];
+    const hIdx = Math.max(0, Math.min(23, Math.floor(info.hours[k])));
+    const t = loc.hourly.temperature_2m[hIdx];
     if (t == null) return;
-    const pr = loc.hourly.precipitation ? (loc.hourly.precipitation[hour] || 0) : 0;
-    const ws = loc.hourly.wind_speed_10m ? (loc.hourly.wind_speed_10m[hour] || 0) : 0;
-    const wc = loc.hourly.weather_code ? loc.hourly.weather_code[hour] : null;
+    const pr = loc.hourly.precipitation ? (loc.hourly.precipitation[hIdx] || 0) : 0;
+    const ws = loc.hourly.wind_speed_10m ? (loc.hourly.wind_speed_10m[hIdx] || 0) : 0;
+    const wc = loc.hourly.weather_code ? loc.hourly.weather_code[hIdx] : null;
     shown++;
-    const info = wmoInfo(wc);
+    const wx = wmoInfo(wc);
     if (t < minTemp) { minTemp = t; minTempKm = (p.dist / 1000).toFixed(1); }
     if (pr > 0.1) wetCount++;
     if (ws > maxWind) maxWind = ws;
-    let plan = '';
-    if (state.hasTime && Number.isFinite(p.time)) {
-      const d = new Date(p.time);
-      plan = ' · Track ' + fmt(d.getHours()) + ':' + String(d.getMinutes()).padStart(2, '0');
-    }
     const eleTxt = (state.hasEle && state.sm && Number.isFinite(state.sm[i])) ? ' · ' + fmt(Math.round(state.sm[i])) + ' m' : '';
-    cards.push('<div class="card"><div class="label">km ' + (p.dist / 1000).toFixed(1) + eleTxt + '</div><div class="value">' + info[0] + ' ' + fmt(t, 1) + '°</div><div class="wxdetail">' + (info[1] ? info[1] + ' · ' : '') + 'Regen ' + fmt(pr, 1) + ' mm · Wind ' + fmt(Math.round(ws)) + ' km/h' + plan + '</div></div>');
+    cards.push('<div class="card"><div class="label">km ' + (p.dist / 1000).toFixed(1) + eleTxt + ' · ~' + fmtHour(info.hours[k]) + '</div><div class="value">' + wx[0] + ' ' + fmt(t, 1) + '°</div><div class="wxdetail">' + (wx[1] ? wx[1] + ' · ' : '') + 'Regen ' + fmt(pr, 1) + ' mm · Wind ' + fmt(Math.round(ws)) + ' km/h</div></div>');
   });
   $('#wxCards').innerHTML = cards.join('');
-  let s = 'Vorhersage für ' + wxCache.date + ', ' + $('#wxHourLbl').textContent + ' · Quelle: Open-Meteo';
+  let s = 'Vorhersage für ' + wxCache.date + ' · ' + (info.mode === 'track' ? 'Ankunftszeiten aus Track' : 'Simulation: Start ' + $('#wxHourLbl').textContent + ', CH-Wanderformel') + ' · Quelle: Open-Meteo';
   if (minTemp !== Infinity) s += ' · kältester Punkt: km ' + minTempKm + ' mit ' + fmt(minTemp, 1) + '°';
   if (wetCount > 0) s += ' · ⚠️ Niederschlag an ' + wetCount + ' von ' + shown + ' Punkten';
   if (maxWind >= 40) s += ' · ⚠️ starker Wind bis ' + fmt(Math.round(maxWind)) + ' km/h';
   $('#wxStatus').textContent = s;
+}
+
+/* Wetter-Marker direkt auf der Karte: Symbol + Temperatur + Ankunftszeit */
+function renderWxPills() {
+  const host = $('#wxPills');
+  if (!host) return;
+  host.innerHTML = '';
+  if (!wxCache || !state) return;
+  const el = $('#map');
+  const W = el.clientWidth, H = el.clientHeight;
+  if (!W) return;
+  const z = Math.round(map.z);
+  const cx = lon2tx(map.lon, z) * 256, cy = lat2ty(map.lat, z) * 256;
+  const info = arrivalInfo();
+  wxCache.arr.forEach((loc, k) => {
+    const i = wxCache.idxs[k];
+    const p = state.points[i];
+    if (!loc.hourly || !loc.hourly.temperature_2m) return;
+    const hIdx = Math.max(0, Math.min(23, Math.floor(info.hours[k])));
+    const t = loc.hourly.temperature_2m[hIdx];
+    if (t == null) return;
+    const pr = loc.hourly.precipitation ? (loc.hourly.precipitation[hIdx] || 0) : 0;
+    const wc = loc.hourly.weather_code ? loc.hourly.weather_code[hIdx] : null;
+    const wx = wmoInfo(wc);
+    const div = document.createElement('div');
+    div.className = 'wxpill' + (pr > 0.1 ? ' rain' : '');
+    div.innerHTML = wx[0] + ' ' + fmt(t, 0) + '°<small>' + fmtHour(info.hours[k]) + '</small>';
+    div.style.left = (lon2tx(p.lon, z) * 256 - cx + W / 2) + 'px';
+    div.style.top = (lat2ty(p.lat, z) * 256 - cy + H / 2) + 'px';
+    host.appendChild(div);
+  });
 }
 
 /* ---------- Live-Tracking über GPS (alles lokal) ---------- */
