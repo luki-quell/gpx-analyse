@@ -112,6 +112,10 @@
   .wxpill small { font-weight: 500; color: #5b6b78; margin-left: 5px; }
   .wxpill.rain { border-color: #e5a0a0; background: #fff5f5; }
   #weatherBlock select { font: inherit; padding: 7px 10px; border-radius: 10px; border: 1px solid #c7d2db; background: #fff; color: #17242f; }
+  #navCard { border-color: #1c7ed6; background: #f0f7ff; }
+  #dotNav { background: #1c7ed6; display: none; width: 15px; height: 15px; box-shadow: 0 0 0 2px rgba(28,126,214,.45); animation: navPulse 2s infinite; }
+  @keyframes navPulse { 0% { box-shadow: 0 0 0 0 rgba(28,126,214,.55); } 70% { box-shadow: 0 0 0 16px rgba(28,126,214,0); } 100% { box-shadow: 0 0 0 0 rgba(28,126,214,0); } }
+  #navOffPath { fill: none; stroke: #d9480f; stroke-width: 2.5; stroke-dasharray: 6 5; display: none; }
   footer { color: #7d8b96; font-size: 12.5px; padding: 30px 16px 40px; line-height: 1.6; }
 </style>
 </head>
@@ -150,9 +154,21 @@
         <button id="liveStopBtn">Verwerfen</button>
       </span>
     </div>
+    <div id="navCard" class="summarybar" hidden>
+      <span style="min-width:0;">
+        <span class="fname" id="navStatus">🧭 Navigation läuft</span>
+        <div id="navStats"></div>
+      </span>
+      <span style="display:flex;gap:10px;flex-wrap:wrap;">
+        <button id="navPauseBtn">Pause</button>
+        <button id="navVoiceBtn">🔇 Ansagen aus</button>
+        <button id="navStopBtn" class="primary">Beenden</button>
+      </span>
+    </div>
     <div class="summarybar">
       <span class="fname" id="fname"></span>
       <span style="display:flex;gap:10px;">
+        <button id="navBtn" class="primary">🧭 Navigation</button>
         <button id="gpxBtn">GPX exportieren</button>
         <button id="csvBtn">CSV exportieren</button>
         <button id="resetBtn">Neue Analyse</button>
@@ -184,10 +200,12 @@
               </linearGradient>
             </defs>
             <path id="trackPath" />
+            <path id="navOffPath" />
           </svg>
           <div id="dotStart" class="mapdot"></div>
           <div id="dotEnd" class="mapdot"></div>
           <div id="dotHover" class="mapdot"></div>
+          <div id="dotNav" class="mapdot"></div>
           <div id="wxPills"></div>
           <div id="coordBox" hidden></div>
           <div id="offlineNote" hidden>Offline: Kartenkacheln nicht verfügbar – der Track wird ohne Hintergrund angezeigt. Mit Internetverbindung erscheint die Karte.</div>
@@ -365,6 +383,7 @@ function analyzeText(text, fileName) {
 }
 
 function analyzePoints(points, segRanges, wpts, fileName, liveMode) {
+  if (nav) stopNavigation();
   const n = points.length;
   if (n === 0) throw new Error('Keine Trackpunkte gefunden.');
   const hasEle = points.filter(p => Number.isFinite(p.ele)).length / n > 0.8;
@@ -414,6 +433,7 @@ function render() {
   $('#results').hidden = false;
   $('#dropzone').hidden = true;
   $('#liveCard').hidden = !state.live;
+  $('#navBtn').style.display = state.live ? 'none' : '';
   wxCache = null;
   $('#wxCards').innerHTML = '';
   $('#wxPills').innerHTML = '';
@@ -722,6 +742,21 @@ function renderOverlay() {
   const hd = $('#dotHover');
   if (hoverIdxMap != null) { hd.style.display = 'block'; place('#dotHover', pts[hoverIdxMap]); }
   else hd.style.display = 'none';
+  const nd = $('#dotNav');
+  const nl = $('#navOffPath');
+  if (nav && nav.pos) {
+    nd.style.display = 'block';
+    nd.style.left = px(nav.pos) + 'px';
+    nd.style.top = py(nav.pos) + 'px';
+    if (nav.offRoute && nav.snapIdx != null) {
+      const sp = pts[nav.snapIdx];
+      nl.setAttribute('d', 'M' + px(nav.pos).toFixed(1) + ' ' + py(nav.pos).toFixed(1) + 'L' + px(sp).toFixed(1) + ' ' + py(sp).toFixed(1));
+      nl.style.display = '';
+    } else nl.style.display = 'none';
+  } else {
+    nd.style.display = 'none';
+    nl.style.display = 'none';
+  }
   renderWxPills();
 }
 
@@ -1271,6 +1306,220 @@ $('#livePauseBtn').addEventListener('click', () => {
 $('#liveFinishBtn').addEventListener('click', finishLive);
 $('#liveStopBtn').addEventListener('click', discardLive);
 
+/* ---------- Navigation: Track-Führung mit GPS (komplett lokal) ---------- */
+let nav = null;
+
+function bearingDeg(a, b) {
+  const r = Math.PI / 180;
+  const p1 = a.lat * r, p2 = b.lat * r, dl = (b.lon - a.lon) * r;
+  const y = Math.sin(dl) * Math.cos(p2);
+  const x = Math.cos(p1) * Math.sin(p2) - Math.sin(p1) * Math.cos(p2) * Math.cos(dl);
+  return Math.atan2(y, x) * 180 / Math.PI;
+}
+
+function turnInfo(turn) {
+  const a = Math.abs(turn);
+  const side = turn > 0 ? 'rechts' : 'links';
+  if (a >= 120) return { icon: turn > 0 ? '↪' : '↩', text: 'scharf ' + side };
+  if (a >= 60) return { icon: turn > 0 ? '→' : '←', text: side + ' abbiegen' };
+  return { icon: turn > 0 ? '↱' : '↰', text: side + ' halten' };
+}
+
+/* Richtungswechsel aus der Track-Geometrie + Wegpunkte als Ansagepunkte */
+function extractManeuvers() {
+  const pts = state.points;
+  if (pts.length < 3) return [];
+  const nodes = [];
+  let nextD = 0;
+  for (let i = 0; i < pts.length; i++) {
+    if (pts[i].dist >= nextD) { nodes.push(i); nextD = pts[i].dist + 20; }
+  }
+  const raw = [];
+  for (let k = 1; k < nodes.length - 1; k++) {
+    const a = pts[nodes[k - 1]], b = pts[nodes[k]], c = pts[nodes[k + 1]];
+    let turn = bearingDeg(b, c) - bearingDeg(a, b);
+    while (turn > 180) turn -= 360;
+    while (turn < -180) turn += 360;
+    if (Math.abs(turn) >= 35) raw.push({ dist: pts[nodes[k]].dist, idx: nodes[k], turn });
+  }
+  const ded = [];
+  for (const m of raw) {
+    const last = ded[ded.length - 1];
+    if (last && m.dist - last.dist < 30) {
+      if (Math.abs(m.turn) > Math.abs(last.turn)) ded[ded.length - 1] = m;
+    } else ded.push(m);
+  }
+  for (const w of state.wpts) {
+    let bestI = 0, bestD = Infinity;
+    for (let i = 0; i < pts.length; i++) { const d = haversine(w, pts[i]); if (d < bestD) { bestD = d; bestI = i; } }
+    if (bestD < 100) ded.push({ dist: pts[bestI].dist, idx: bestI, turn: 0, wpt: w.name });
+  }
+  ded.sort((x, y) => x.dist - y.dist);
+  return ded;
+}
+
+function speak(txt) {
+  if (!nav || !nav.voice || !('speechSynthesis' in window)) return;
+  try {
+    const u = new SpeechSynthesisUtterance(txt);
+    u.lang = 'de-DE';
+    speechSynthesis.speak(u);
+  } catch (e) { /* ignorieren */ }
+}
+
+async function startNavigation() {
+  if (!state || state.live || nav) return;
+  $('#navCard').hidden = false;
+  if (!navigator.geolocation) {
+    $('#navStatus').textContent = '🧭 Navigation';
+    $('#navStats').textContent = 'Dieser Browser unterstützt keine Standortbestimmung.';
+    return;
+  }
+  nav = {
+    paused: false, pos: null, acc: null, snapIdx: null, snapDist: 0, offRoute: false, offAnnounced: false,
+    voice: false, maneuvers: extractManeuvers(), announced: new Set(), wakeLock: null, watchId: null,
+    cu: (state.hasEle && state.sm) ? cumUpDown(state.sm) : null, finished: false
+  };
+  $('#navStatus').textContent = '🧭 Navigation – ' + (state.fileName || 'Track');
+  $('#navPauseBtn').textContent = 'Pause';
+  $('#navVoiceBtn').textContent = '🔇 Ansagen aus';
+  $('#navStats').innerHTML = 'Warte auf GPS-Signal …';
+  try {
+    if (navigator.wakeLock && navigator.wakeLock.request) nav.wakeLock = await navigator.wakeLock.request('screen');
+  } catch (e) { /* Wake Lock nicht verfügbar */ }
+  nav.watchId = navigator.geolocation.watchPosition(navPosUpdate, navErr, { enableHighAccuracy: true, maximumAge: 3000, timeout: 15000 });
+}
+
+function navErr(err) {
+  if (!nav) return;
+  const msgs = { 1: 'Standortzugriff verweigert – bitte im Browser erlauben.', 2: 'Position nicht verfügbar.', 3: 'Zeitüberschreitung beim GPS-Empfang.' };
+  $('#navStats').innerHTML = '⚠️ ' + (msgs[err.code] || err.message);
+}
+
+/* GPS-Position auf den Track snappen (inkrementelle Suche mit Full-Scan-Fallback) */
+function snapToRoute(p) {
+  const pts = state.points;
+  const first = nav.pos == null;
+  const R = 200;
+  let bestI = 0, bestD = Infinity;
+  const scan = (lo, hi) => {
+    for (let i = Math.max(0, lo); i <= Math.min(pts.length - 1, hi); i++) {
+      const d = haversine(p, pts[i]);
+      if (d < bestD) { bestD = d; bestI = i; }
+    }
+  };
+  if (!first) scan(nav.snapIdx - R, nav.snapIdx + R);
+  if (first || bestD > 100) { bestD = Infinity; bestI = 0; scan(0, pts.length - 1); }
+  return { idx: bestI, dist: bestD };
+}
+
+function navPosUpdate(pos) {
+  if (!nav || nav.paused || !state) return;
+  const c = pos.coords;
+  nav.acc = c.accuracy;
+  const p = { lat: c.latitude, lon: c.longitude, ele: c.altitude, time: pos.timestamp };
+  nav.pos = p;
+  const snap = snapToRoute(p);
+  nav.snapIdx = snap.idx;
+  nav.snapDist = snap.dist;
+  nav.offRoute = snap.dist > 50;
+  const pts = state.points;
+  const done = pts[snap.idx].dist;
+  if (nav.offRoute && !nav.offAnnounced) { nav.offAnnounced = true; speak('Achtung, abseits der Route'); }
+  if (!nav.offRoute) nav.offAnnounced = false;
+  const m = nav.maneuvers.find(x => x.dist > done + 5);
+  if (!nav.offRoute && m) {
+    const dM = m.dist - done;
+    const key = m.dist + ':' + (m.wpt || m.turn);
+    if (dM <= 100 && !nav.announced.has(key + ':f')) {
+      nav.announced.add(key + ':f');
+      speak('In hundert Metern: ' + (m.wpt ? 'Wegpunkt ' + m.wpt : turnInfo(m.turn).text));
+    }
+    if (dM <= 25 && !nav.announced.has(key + ':n')) {
+      nav.announced.add(key + ':n');
+      speak(m.wpt ? 'Wegpunkt ' + m.wpt : turnInfo(m.turn).text);
+    }
+  }
+  const rem = Math.max(0, state.total - done);
+  if (!nav.finished && rem < 25) {
+    nav.finished = true;
+    speak('Ziel erreicht');
+    $('#navStatus').textContent = '🏁 Ziel erreicht';
+  }
+  updateNavUI(done, rem);
+  renderOverlay();
+  autoCenter();
+}
+
+function updateNavUI(done, rem) {
+  if (!nav) return;
+  let upRem = 0, downRem = 0;
+  if (nav.cu) {
+    const i = Math.min(nav.snapIdx, nav.cu.up.length - 1);
+    upRem = Math.max(0, nav.cu.up[nav.cu.up.length - 1] - nav.cu.up[i]);
+    downRem = Math.max(0, nav.cu.down[nav.cu.down.length - 1] - nav.cu.down[i]);
+  }
+  const hours = rem / 1000 / 4.2 + (nav.cu ? upRem / 400 + downRem / 800 : 0);
+  const eta = new Date(Date.now() + hours * 3600 * 1000);
+  let mHtml = 'Weg folgen';
+  const m = nav.maneuvers.find(x => x.dist > done + 5);
+  if (m) {
+    const dM = m.dist - done;
+    mHtml = m.wpt
+      ? '📍 ' + m.wpt + ' · in ' + fmt(Math.round(dM)) + ' m'
+      : turnInfo(m.turn).icon + ' ' + turnInfo(m.turn).text + ' · in ' + fmt(Math.round(dM)) + ' m';
+  }
+  let html = '<div style="font-size:16px;font-weight:600;">' + mHtml + '</div>';
+  html += '<div>km ' + fmt(done / 1000, 1) + ' von ' + fmt(state.total / 1000, 1) + ' · übrig ' + fmtKm(rem) +
+    (nav.cu ? ' · ↑ ' + fmtEle(upRem) + ' ↓ ' + fmtEle(downRem) : '') + '</div>';
+  html += '<div>Restzeit ~' + fmtDur(hours * 3600) + ' · Ankunft ~' + String(eta.getHours()).padStart(2, '0') + ':' + String(eta.getMinutes()).padStart(2, '0') +
+    ' · GPS ±' + fmt(Math.round(nav.acc || 0)) + ' m</div>';
+  if (nav.offRoute) html += '<div style="color:#c92a2a;font-weight:600;">⚠️ Abseits der Route – folge der roten Linie zurück zum Track</div>';
+  $('#navStats').innerHTML = html;
+}
+
+function autoCenter() {
+  if (!nav || !nav.pos) return;
+  const el = $('#map');
+  const W = el.clientWidth, H = el.clientHeight;
+  if (!W) return;
+  const z = Math.round(map.z);
+  const cx = lon2tx(map.lon, z) * 256, cy = lat2ty(map.lat, z) * 256;
+  const px = lon2tx(nav.pos.lon, z) * 256 - cx + W / 2;
+  const py = lat2ty(nav.pos.lat, z) * 256 - cy + H / 2;
+  if (px < W * 0.15 || px > W * 0.85 || py < H * 0.15 || py > H * 0.85) {
+    map.lat = nav.pos.lat;
+    map.lon = nav.pos.lon;
+    renderTiles();
+    renderOverlay();
+  }
+}
+
+function stopNavigation() {
+  if (!nav) return;
+  if (nav.watchId != null) navigator.geolocation.clearWatch(nav.watchId);
+  try { if (nav.wakeLock) nav.wakeLock.release(); } catch (e) { /* ignorieren */ }
+  try { if ('speechSynthesis' in window) speechSynthesis.cancel(); } catch (e) { /* ignorieren */ }
+  nav = null;
+  $('#navCard').hidden = true;
+  renderOverlay();
+}
+
+$('#navBtn').addEventListener('click', startNavigation);
+$('#navPauseBtn').addEventListener('click', () => {
+  if (!nav) return;
+  nav.paused = !nav.paused;
+  $('#navPauseBtn').textContent = nav.paused ? 'Weiter' : 'Pause';
+  $('#navStatus').textContent = nav.paused ? '⏸️ Navigation pausiert' : '🧭 Navigation – ' + (state ? (state.fileName || 'Track') : '');
+});
+$('#navVoiceBtn').addEventListener('click', () => {
+  if (!nav) return;
+  nav.voice = !nav.voice;
+  $('#navVoiceBtn').textContent = nav.voice ? '🔊 Ansagen an' : '🔇 Ansagen aus';
+  if (nav.voice) speak('Sprachansagen aktiviert');
+});
+$('#navStopBtn').addEventListener('click', stopNavigation);
+
 /* ---------- Datei-Handling ---------- */
 function showError(msg) {
   $('#results').hidden = false;
@@ -1302,6 +1551,7 @@ dz.addEventListener('drop', e => {
 });
 
 $('#resetBtn').addEventListener('click', () => {
+  if (nav) stopNavigation();
   if (live) {
     stopLiveWatch();
     live = null;
